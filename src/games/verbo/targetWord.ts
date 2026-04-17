@@ -1,16 +1,66 @@
-export const WORDS = ["TERMO", "CASAS", "VERDE", "FORTE", "NIVEL"];
+export const WORDS = {
+  easy: [
+    "CASAL",
+    "AMIGO",
+    "NOITE",
+    "VENTO",
+    "LIVRO",
+    "CAMPO",
+    "PRAIA",
+    "JOGAR",
+    "FALAR",
+    "TEMPO",
+  ],
+  medium: [
+    "TERMO",
+    "NIVEL",
+    "LETRA",
+    "TEXTO",
+    "PLANO",
+    "GRUPO",
+    "VALOR",
+    "LINHA",
+    "PONTO",
+    "PORTA",
+    "CAIXA",
+    "SINAL",
+    "FORTE",
+    "FRACO",
+    "PROVA",
+    "MOTOR",
+    "IDEIA",
+    "NORTE",
+    "SULCO",
+    "AULAS",
+  ],
+  hard: [
+    "TENAZ",
+    "FUGAZ",
+    "NEXOS",
+    "SUTIL",
+    "ARDOR",
+    "VIGOR",
+    "CRIVO",
+    "PLENO",
+    "TRAMA",
+    "DENSO",
+    "RISCO",
+    "ASTRO",
+    "MAGIA",
+    "LIMPO",
+    "NOBRE",
+    "TERNO",
+    "MORAL",
+    "VITAL",
+    "FINAL",
+    "JUSTO",
+  ],
+} as const;
 
-export function getWordOfTheDay(): string {
-  const today = new Date().toDateString();
-  let hash = 0;
+export type Difficulty = keyof typeof WORDS;
 
-  for (let i = 0; i < today.length; i++) {
-    hash += today.charCodeAt(i);
-  }
-
-  return WORDS[hash % WORDS.length];
-}
-
-export function getRandomWord(): string {
-  return WORDS[Math.floor(Math.random() * WORDS.length)];
+export function pickRandomWord(difficulty: Difficulty): string {
+  const list = WORDS[difficulty];
+  const index = Math.floor(Math.random() * list.length);
+  return list[index];
 }

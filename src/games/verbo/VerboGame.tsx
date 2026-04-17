@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { CSSProperties } from "react";
-import { getRandomWord, getWordOfTheDay } from "./targetWord";
+import type { CSSProperties, MouseEvent } from "react";
+import { pickRandomWord, type Difficulty } from "./targetWord";
+import { loadVerboStats, maxGuessCount, recordLoss, recordWin } from "./verboStats";
+import type { VerboStatsSnapshot } from "./verboStats";
 import TermoStarfield from "./TermoStarfield";
+import VerboWebField from "./VerboWebField";
 import "./verbo.css";
 
 const ROWS = 6;
@@ -20,6 +23,31 @@ const ROWS_KB = [
   ["A", "S", "D", "F", "G", "H", "J", "K", "L"],
   ["ENTER", "Z", "X", "C", "V", "B", "N", "M", "BACK"],
 ];
+
+const WIN_REACTION_TITLES = ["Boa!", "Mandou bem!", "Impressionante!", "Brabo!"] as const;
+const LOSE_REACTION_TITLES = ["Quase!", "Não foi dessa vez", "Tenta mais uma"] as const;
+
+/** Farpas leves no modo fácil após vitória rápida (1–3 tentativas) — só exibição, não altera regras. */
+const EASY_WIN_TEASE_MESSAGES = [
+  "foi fácil demais...",
+  "bora subir o nível?",
+  "isso foi só aquecimento",
+  "você consegue mais",
+  "modo passeio?",
+  "ou você joga sério?",
+] as const;
+
+function pickReaction<T extends readonly string[]>(arr: T): T[number] {
+  return arr[Math.floor(Math.random() * arr.length)]!;
+}
+
+function pickEasyWinTease(): string {
+  return pickReaction(EASY_WIN_TEASE_MESSAGES);
+}
+
+type ResultPanelState =
+  | { outcome: "won"; title: string; attempt: number; secret: string }
+  | { outcome: "lost"; title: string; secret: string };
 
 function emptyLetters(): string[] {
   return Array(COLS).fill("");
@@ -55,6 +83,15 @@ function evaluateGuess(guess: string, target: string): LetterState[] {
   return state;
 }
 
+/**
+ * Valida tentativa (5 letras) e devolve feedback por posição (verde / amarelo / cinza).
+ * Usa a mesma regra que o Wordle para letras repetidas (`evaluateGuess`).
+ */
+function checkGuess(guess: string, secret: string): LetterState[] | null {
+  if (guess.length !== 5) return null;
+  return evaluateGuess(guess, secret);
+}
+
 function rankHint(a: KeyHint, b: LetterState): KeyHint {
   const order = { absent: 0, present: 1, correct: 2 };
   const br = b;
@@ -62,10 +99,25 @@ function rankHint(a: KeyHint, b: LetterState): KeyHint {
   return order[a] >= order[br] ? a : br;
 }
 
+/** Espelho do estado do jogo para depuração e próximos passos (menu / novo jogo / dificuldade). */
+const initialGameState = {
+  difficulty: "easy" as Difficulty,
+  secretWord: "",
+  currentRow: 0,
+  guesses: ["", "", "", "", "", ""] as string[],
+  status: "playing" as "playing" | "won" | "lost",
+};
+
 export default function VerboGame() {
   const verboRootRef = useRef<HTMLDivElement>(null);
   const revealTimersRef = useRef<number[]>([]);
-  const [target, setTarget] = useState(() => getWordOfTheDay());
+  const gameStateRef = useRef({ ...initialGameState });
+  const [difficulty, setDifficulty] = useState<Difficulty>("easy");
+  const [target, setTarget] = useState(() => {
+    const w = pickRandomWord("easy");
+    console.log("Palavra secreta:", w);
+    return w;
+  });
   const [showRules, setShowRules] = useState(true);
   const [grid, setGrid] = useState<string[][]>(() =>
     Array.from({ length: ROWS }, () => Array(COLS).fill(""))
@@ -86,6 +138,16 @@ export default function VerboGame() {
   const [shakeRow, setShakeRow] = useState<number | null>(null);
   /** Linha em revelação com flip (null = nenhuma animação ativa). */
   const [revealingRow, setRevealingRow] = useState<number | null>(null);
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const [verboStats, setVerboStats] = useState<VerboStatsSnapshot>(() => loadVerboStats());
+  const [resultPanel, setResultPanel] = useState<ResultPanelState | null>(null);
+  /** HARD: feedback visual (CSS) — não altera regras do jogo */
+  const [hardWrongFlash, setHardWrongFlash] = useState(false);
+  const [hardGridPulse, setHardGridPulse] = useState(false);
+  /** HARD: tentativas erradas na partida — pressão acumulada do tema (0–5 exposto em data-pressure) */
+  const [hardWrongCount, setHardWrongCount] = useState(0);
+  /** EASY: provocação sutil após vitória em poucas tentativas (só UI). */
+  const [easyWinTease, setEasyWinTease] = useState<string | null>(null);
 
   const isPlaying = status === "playing";
   const inputLocked = revealingRow !== null;
@@ -98,10 +160,16 @@ export default function VerboGame() {
     revealTimersRef.current = [];
   }, []);
 
-  const resetGame = useCallback(() => {
+  const startGame = useCallback((nextDifficulty?: Difficulty) => {
     clearRevealTimers();
     setRevealingRow(null);
-    setTarget(getRandomWord());
+    const d = nextDifficulty !== undefined ? nextDifficulty : difficulty;
+    if (nextDifficulty !== undefined && nextDifficulty !== difficulty) {
+      setDifficulty(nextDifficulty);
+    }
+    const secret = pickRandomWord(d);
+    setTarget(secret);
+    console.log("Palavra secreta:", secret);
     setGrid(Array.from({ length: ROWS }, () => Array(COLS).fill("")));
     setEvaluated(Array.from({ length: ROWS }, () => Array(COLS).fill(null)));
     setCurrentRow(0);
@@ -110,7 +178,57 @@ export default function VerboGame() {
     setStatus("playing");
     setMessage("");
     setShakeRow(null);
-  }, [clearRevealTimers]);
+    setResultPanel(null);
+    setHardWrongFlash(false);
+    setHardGridPulse(false);
+    setHardWrongCount(0);
+    setEasyWinTease(null);
+  }, [clearRevealTimers, difficulty]);
+
+  const onPlayAgainClick = useCallback(
+    (e: MouseEvent<HTMLButtonElement>) => {
+      e.preventDefault();
+      e.stopPropagation();
+      console.log("[Verbo] Jogar novamente");
+      startGame();
+    },
+    [startGame]
+  );
+
+  useEffect(() => {
+    const guesses = Array.from({ length: ROWS }, (_, r) => {
+      if (r < currentRow) return grid[r].join("");
+      if (r === currentRow) return rowDraft.letters.join("");
+      return "";
+    });
+    gameStateRef.current = {
+      difficulty,
+      secretWord: target,
+      currentRow,
+      guesses,
+      status,
+    };
+  }, [difficulty, target, currentRow, grid, rowDraft, status]);
+
+  /** Expõe controles para menu / novo jogo (desktop/mobile) sem alterar o markup. */
+  useEffect(() => {
+    const root = verboRootRef.current;
+    if (!root) return;
+    const controls = { setDifficulty, startGame, getGameState: () => gameStateRef.current };
+    (root as HTMLElement & { __termo?: typeof controls }).__termo = controls;
+    return () => {
+      delete (root as HTMLElement & { __termo?: typeof controls }).__termo;
+    };
+  }, [setDifficulty, startGame]);
+
+  useEffect(() => {
+    if (!isMenuOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setIsMenuOpen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isMenuOpen]);
 
   const updateKeyHints = useCallback((guess: string, states: LetterState[]) => {
     setKeyHints((prev) => {
@@ -135,17 +253,53 @@ export default function VerboGame() {
       return;
     }
 
-    const states = evaluateGuess(guess, target);
+    const states = checkGuess(guess, target);
+    if (!states) return;
     const row = currentRow;
 
     const finalizeGuess = () => {
       updateKeyHints(guess, states);
+
+      const motionOk =
+        typeof window === "undefined" ||
+        !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      if (difficulty === "hard" && motionOk) {
+        if (guess !== target) {
+          setHardWrongFlash(true);
+          window.setTimeout(() => setHardWrongFlash(false), 220);
+        }
+        if (states.some((s) => s === "correct")) {
+          setHardGridPulse(true);
+          window.setTimeout(() => setHardGridPulse(false), 420);
+        }
+      }
+
       if (guess === target) {
+        const attempt = row + 1;
+        setVerboStats(recordWin(attempt));
+        setResultPanel({
+          outcome: "won",
+          title: pickReaction(WIN_REACTION_TITLES),
+          attempt,
+          secret: target,
+        });
+        if (difficulty === "easy" && attempt >= 1 && attempt <= 3) {
+          setEasyWinTease(pickEasyWinTease());
+        }
         setStatus("won");
         setRowDraft({ letters: emptyLetters(), cursorIndex: 0 });
         return;
       }
+      if (difficulty === "hard") {
+        setHardWrongCount((n) => n + 1);
+      }
       if (row === ROWS - 1) {
+        setVerboStats(recordLoss());
+        setResultPanel({
+          outcome: "lost",
+          title: pickReaction(LOSE_REACTION_TITLES),
+          secret: target,
+        });
         setStatus("lost");
         setRowDraft({ letters: emptyLetters(), cursorIndex: 0 });
         return;
@@ -212,6 +366,7 @@ export default function VerboGame() {
     updateKeyHints,
     inputLocked,
     clearRevealTimers,
+    difficulty,
   ]);
 
   useEffect(() => {
@@ -274,6 +429,7 @@ export default function VerboGame() {
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (showRules) return;
+      if (status !== "playing") return;
       if (inputLocked) return;
       if (e.ctrlKey || e.metaKey || e.altKey) return;
 
@@ -305,9 +461,10 @@ export default function VerboGame() {
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [addLetter, backspace, moveCursor, showRules, submitGuess, inputLocked]);
+  }, [addLetter, backspace, moveCursor, showRules, submitGuess, inputLocked, status]);
 
   const onVirtualKey = (key: string) => {
+    if (status !== "playing") return;
     if (inputLocked) return;
     if (key === "ENTER") {
       submitGuess();
@@ -367,9 +524,88 @@ export default function VerboGame() {
     focusCell(c);
   };
 
+  const closeMenu = () => setIsMenuOpen(false);
+
+  const onMenuNewGame = () => {
+    startGame();
+    closeMenu();
+  };
+
+  const onMenuDifficulty = (d: Difficulty) => {
+    startGame(d);
+    closeMenu();
+  };
+
+  const guessDistMax = maxGuessCount(verboStats.guessDistribution);
+
+  /** 0–5: erros reais na rodada; escala visual 0–1 (5 erros = pressão máxima) */
+  const hardPressureLevel = difficulty === "hard" ? Math.min(hardWrongCount, 5) : 0;
+  const hardTension = difficulty === "hard" ? hardPressureLevel / 5 : 0;
+  const hardClutch = difficulty === "hard" && currentRow >= ROWS - 2 ? 1 : 0;
+
   return (
-    <div className="verbo" ref={verboRootRef}>
-      <TermoStarfield containerRef={verboRootRef} />
+    <div
+      className={[
+        "verbo",
+        difficulty === "hard" && hardWrongFlash ? "verbo--hard-wrong-flash" : "",
+        difficulty === "hard" && hardGridPulse ? "verbo--hard-grid-pulse" : "",
+      ]
+        .filter(Boolean)
+        .join(" ")}
+      ref={verboRootRef}
+      data-difficulty={difficulty}
+      data-theme={difficulty}
+      data-game-status={status}
+      {...(difficulty === "hard"
+        ? {
+            "data-pressure": String(hardPressureLevel),
+            style: {
+              "--verbo-hard-tension": hardTension,
+              "--verbo-hard-clutch": hardClutch,
+            } as CSSProperties,
+          }
+        : {})}
+    >
+      {difficulty === "easy" && <TermoStarfield containerRef={verboRootRef} />}
+      {difficulty === "medium" && <VerboWebField containerRef={verboRootRef} />}
+      {difficulty === "hard" && (
+        <div className="verbo__hardfield" aria-hidden>
+          <div className="verbo__hardfield-spikes" />
+          <div className="verbo__hardfield-ghost">
+            <svg
+              className="verbo__hardfield-sub"
+              viewBox="0 0 520 200"
+              preserveAspectRatio="xMidYMid slice"
+              xmlns="http://www.w3.org/2000/svg"
+            >
+              <g
+                className="verbo__hardfield-sub-frag verbo__hardfield-sub-frag--a"
+                fill="rgba(155, 82, 92, 0.45)"
+              >
+                <text x="8" y="72" fontSize="38" fontWeight="700" fontFamily="system-ui,Segoe UI,sans-serif">
+                  ta
+                </text>
+              </g>
+              <g
+                className="verbo__hardfield-sub-frag verbo__hardfield-sub-frag--b"
+                fill="rgba(120, 160, 185, 0.35)"
+              >
+                <text x="380" y="150" fontSize="31" fontWeight="600" fontFamily="system-ui,Segoe UI,sans-serif">
+                  dif
+                </text>
+              </g>
+              <g
+                className="verbo__hardfield-sub-frag verbo__hardfield-sub-frag--c"
+                fill="rgba(140, 95, 88, 0.4)"
+              >
+                <text x="118" y="188" fontSize="26" fontWeight="600" fontFamily="system-ui,Segoe UI,sans-serif">
+                  cil
+                </text>
+              </g>
+            </svg>
+          </div>
+        </div>
+      )}
       {showRules && (
         <div className="verbo__backdrop" role="dialog" aria-modal="true" aria-labelledby="termo-rules-title">
           <div className="verbo__modal">
@@ -410,56 +646,117 @@ export default function VerboGame() {
         </div>
       )}
 
-      {showResultModal && (
-        <div
-          className="verbo__backdrop verbo__backdrop--result"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="termo-result-title"
-        >
-          <div className="verbo__modal verbo__modal--result">
-            <div className="verbo__modal-brand" aria-hidden>
-              TERMO
-            </div>
-            <h2
-              id="termo-result-title"
-              className={
-                status === "won"
-                  ? "verbo__result-title verbo__result-title--win"
-                  : "verbo__result-title verbo__result-title--lose"
-              }
-            >
-              {status === "won" ? "Parabéns!" : "Fim de jogo"}
-            </h2>
-            <p className="verbo__result-main">
-              Palavra do dia: <strong>{target}</strong>
-            </p>
-            <p className="verbo__result-sub">
-              {status === "won" ? "Você acertou" : "Não foi dessa vez"}
-            </p>
-            <div className="verbo__modal-actions">
-              <button type="button" className="verbo__start verbo__start--compact" onClick={resetGame}>
-                Jogar novamente
-              </button>
-            </div>
-            <p className="termo__credit">
-              crafted by{" "}
-              <a
-                href="https://github.com/Wesley-0001"
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                wes
-              </a>
-            </p>
-          </div>
-        </div>
-      )}
-
       <div className="verbo__stage">
         <header className="verbo__header">
-          <h1 className="verbo__title">TERMO</h1>
+          <div className="verbo__header-toolbar">
+            <span className="verbo__header-toolbar-spacer" aria-hidden />
+            <h1 className="verbo__title">TERMO</h1>
+            <div className="verbo__header-toolbar-end">
+              <div className="verbo__menu-root">
+                <button
+                  type="button"
+                  className="verbo__menu-trigger"
+                  aria-expanded={isMenuOpen}
+                  aria-controls="verbo-game-menu"
+                  aria-haspopup="true"
+                  aria-label={isMenuOpen ? "Fechar menu do jogo" : "Abrir menu do jogo"}
+                  onClick={() => setIsMenuOpen((o) => !o)}
+                >
+                  <span className="verbo__menu-icon verbo__menu-icon--hamburger" aria-hidden>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                      <path
+                        d="M4 7h16M4 12h16M4 17h16"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                      />
+                    </svg>
+                  </span>
+                  <span className="verbo__menu-icon verbo__menu-icon--gear" aria-hidden>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                      <path
+                        d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"
+                        stroke="currentColor"
+                        strokeWidth="1.75"
+                        strokeLinejoin="round"
+                      />
+                      <path
+                        d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.06a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.06a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.06a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"
+                        stroke="currentColor"
+                        strokeWidth="1.35"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                  </span>
+                </button>
+              </div>
+            </div>
+          </div>
         </header>
+
+        {isMenuOpen && (
+          <div className="verbo__menu-layer">
+            <div className="verbo__menu-backdrop" aria-hidden onClick={closeMenu} />
+            <div
+              id="verbo-game-menu"
+              className="verbo__menu-panel"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="verbo-menu-title"
+            >
+              <h2 id="verbo-menu-title" className="verbo__menu-title">
+                Menu
+              </h2>
+              <div className="verbo__menu-actions">
+                <button type="button" className="verbo__menu-btn verbo__menu-btn--primary" onClick={onMenuNewGame}>
+                  Novo jogo
+                </button>
+              </div>
+              <p className="verbo__menu-label">Dificuldade</p>
+              <div className="verbo__menu-diff" role="group" aria-label="Dificuldade">
+                {(
+                  [
+                    { id: "easy" as const, label: "Fácil" },
+                    { id: "medium" as const, label: "Médio" },
+                    { id: "hard" as const, label: "Difícil" },
+                  ] as const
+                ).map(({ id, label }) => (
+                  <button
+                    key={id}
+                    type="button"
+                    className={
+                      difficulty === id ? "verbo__menu-chip verbo__menu-chip--active" : "verbo__menu-chip"
+                    }
+                    aria-pressed={difficulty === id}
+                    onClick={() => onMenuDifficulty(id)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <details className="verbo__menu-howto">
+                <summary className="verbo__menu-howto-summary">Como jogar</summary>
+                <div className="verbo__menu-howto-body">
+                  <p>Descubra a palavra de 5 letras em 6 tentativas.</p>
+                  <ul>
+                    <li>
+                      <strong>Verde</strong> — letra certa no lugar certo.
+                    </li>
+                    <li>
+                      <strong>Amarelo</strong> — letra existe, mas está em outro lugar.
+                    </li>
+                    <li>
+                      <strong>Cinza</strong> — letra não existe na palavra.
+                    </li>
+                  </ul>
+                </div>
+              </details>
+              <button type="button" className="verbo__menu-btn verbo__menu-btn--ghost" onClick={closeMenu}>
+                Fechar menu
+              </button>
+            </div>
+          </div>
+        )}
 
         <div className="verbo__game-wrapper">
           <div className="verbo__board-shell">
@@ -537,6 +834,120 @@ export default function VerboGame() {
           </div>
         </div>
       </div>
+
+      {showResultModal && resultPanel && (
+        <div
+          className="verbo__backdrop verbo__backdrop--result verbo__backdrop--result-enter"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="termo-result-title"
+        >
+          <div className="verbo__modal verbo__modal--result verbo__modal--result-enter">
+            <div className="verbo__modal-brand" aria-hidden>
+              TERMO
+            </div>
+            <h2
+              id="termo-result-title"
+              className={
+                resultPanel.outcome === "won"
+                  ? "verbo__result-title verbo__result-title--win"
+                  : "verbo__result-title verbo__result-title--lose"
+              }
+            >
+              {resultPanel.title}
+            </h2>
+            {resultPanel.outcome === "won" ? (
+              <>
+                <p className="verbo__result-sub verbo__result-sub--emph">
+                  Você acertou em {resultPanel.attempt}{" "}
+                  {resultPanel.attempt === 1 ? "tentativa" : "tentativas"}
+                </p>
+                <p className="verbo__result-main">
+                  Palavra certa: <strong>{resultPanel.secret}</strong>
+                </p>
+              </>
+            ) : (
+              <p className="verbo__result-main verbo__result-main--lose">
+                A palavra era: <strong>{resultPanel.secret}</strong>
+              </p>
+            )}
+
+            <section className="verbo__result-stats" aria-label="Estatísticas">
+              <p className="verbo__result-stats-heading">Resumo</p>
+              <div className="verbo__result-stats-grid">
+                <div className="verbo__result-stat">
+                  <span className="verbo__result-stat-value">{verboStats.totalGames}</span>
+                  <span className="verbo__result-stat-label">Jogos</span>
+                </div>
+                <div className="verbo__result-stat">
+                  <span className="verbo__result-stat-value verbo__result-stat-value--win">{verboStats.wins}</span>
+                  <span className="verbo__result-stat-label">Vitórias</span>
+                </div>
+                <div className="verbo__result-stat">
+                  <span className="verbo__result-stat-value verbo__result-stat-value--lose">{verboStats.losses}</span>
+                  <span className="verbo__result-stat-label">Derrotas</span>
+                </div>
+                <div className="verbo__result-stat">
+                  <span className="verbo__result-stat-value">{verboStats.currentStreak}</span>
+                  <span className="verbo__result-stat-label">Sequência</span>
+                </div>
+                <div className="verbo__result-stat">
+                  <span className="verbo__result-stat-value">{verboStats.bestStreak}</span>
+                  <span className="verbo__result-stat-label">Melhor seq.</span>
+                </div>
+              </div>
+              <p className="verbo__result-dist-heading">Vitórias por tentativa</p>
+              <ul className="verbo__result-dist" aria-label="Distribuição de vitórias por número de tentativas">
+                {([1, 2, 3, 4, 5, 6] as const).map((n) => {
+                  const count = verboStats.guessDistribution[n];
+                  const pct = guessDistMax > 0 ? Math.round((count / guessDistMax) * 100) : 0;
+                  return (
+                    <li key={n} className="verbo__result-dist-row">
+                      <span className="verbo__result-dist-n">{n}</span>
+                      <div className="verbo__result-dist-track" aria-hidden>
+                        <div
+                          className="verbo__result-dist-fill"
+                          style={{ width: `${pct}%` }}
+                        />
+                      </div>
+                      <span className="verbo__result-dist-count">{count}</span>
+                    </li>
+                  );
+                })}
+              </ul>
+            </section>
+
+            <div className="verbo__modal-actions">
+              {resultPanel.outcome === "won" && easyWinTease && (
+                <p
+                  className="verbo__easy-win-tease"
+                  aria-hidden
+                  onAnimationEnd={(e) => {
+                    if (/verbo-easy-win-tease/.test(e.animationName)) {
+                      setEasyWinTease(null);
+                    }
+                  }}
+                >
+                  {easyWinTease}
+                </p>
+              )}
+              <button type="button" className="verbo__start verbo__start--compact" onClick={onPlayAgainClick}>
+                Jogar novamente
+              </button>
+            </div>
+            <p className="termo__credit">
+              crafted by{" "}
+              <a
+                href="https://github.com/Wesley-0001"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                wes
+              </a>
+            </p>
+          </div>
+        </div>
+      )}
 
     </div>
   );

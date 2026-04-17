@@ -115,7 +115,9 @@ export default function VerboGame() {
   const [difficulty, setDifficulty] = useState<Difficulty>("easy");
   const [target, setTarget] = useState(() => {
     const w = pickRandomWord("easy");
-    console.log("Palavra secreta:", w);
+    if (import.meta.env.DEV) {
+      console.log("Palavra secreta:", w);
+    }
     return w;
   });
   const [showRules, setShowRules] = useState(true);
@@ -169,7 +171,9 @@ export default function VerboGame() {
     }
     const secret = pickRandomWord(d);
     setTarget(secret);
-    console.log("Palavra secreta:", secret);
+    if (import.meta.env.DEV) {
+      console.log("Palavra secreta:", secret);
+    }
     setGrid(Array.from({ length: ROWS }, () => Array(COLS).fill("")));
     setEvaluated(Array.from({ length: ROWS }, () => Array(COLS).fill(null)));
     setCurrentRow(0);
